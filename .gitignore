@@ -1,0 +1,95 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+pytorch-env/
+axo/
+ANT/
+
+# =========================
+# Jupyter / notebooks
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# Runtime outputs / experiment results
+# =========================
+outputs/
+
+# =========================
+# Model checkpoints / weights
+# =========================
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+predictor/checkpoints/
+
+# =========================
+# Datasets / generated data
+# =========================
+*.jsonl
+*.npy
+*.npz
+*.csv
+*.parquet
+data/
+datasets/
+
+# =========================
+# Hugging Face / transformers cache
+# =========================
+.cache/
+.huggingface/
+huggingface/
+
+# =========================
+# Local model folders
+# =========================
+models/
+checkpoints/
+
+# =========================
+# Temporary / debug files
+# =========================
+tmp/
+temp/
+*.bak
+*.swp

@@ -1,4 +1,5 @@
-#  Maze Agent V4 — LLM + Predictive Hybrid Planner
+#  WorldModel_Agent V4 
+  — LLM + Predictive Hybrid Planner
 
 ##  Overview
 
