@@ -1,182 +1,233 @@
-#  WorldModel_Agent V4 
-<<<<<<< HEAD
-  — LLM + Predictive Hybrid Planner
-=======
-    -LLM + Predictive Hybrid Planner
->>>>>>> 4d40fd0457489a2a1c535c2849b09071f01cfaea
+# Phase-Guided World Model Agent (PG-WMA)
 
-##  Overview
+## Problem
 
-Maze Agent V4 is a hybrid decision-making system that integrates:
+This project started from a simple assumption:
 
-* **Rule-based planning (fast, stable)**
-* **Predictive model (local rollout)**
-* **LLM-based slow planner (global reasoning attempt)**
+If an agent can decompose a task into steps, it should be able to solve it.
 
-The goal of this version is to evaluate whether a language model can improve decision quality in a partially observable navigation task.
+However, this turns out to be insufficient in partially observable environments.
+
+The main issue is that the agent does not operate on fully interpretable states.  
+Instead, it relies on latent representations that are not directly meaningful, and these are difficult for an LLM to reason about in a stable way.
+
+As a result:
+
+- step-level decomposition alone is not enough
+- LLM decisions become inconsistent when grounded on weak representations
+- execution can easily become unstable or inefficient
 
 ---
 
-##  Architecture
+### Initial Direction: World Model
 
+An early approach in this project was to introduce a learned world model (e.g., JEPA-style encoding) to bridge perception and planning.
+
+The idea was to:
+
+- encode observations into a structured latent space
+- use that latent space for prediction and decision making
+
+However, in practice, this approach faced several limitations:
+
+- different interaction types often require separate learned predictors
+- the system becomes increasingly complex as more events are introduced
+- without a general-purpose world model, this approach does not scale well
+
+---
+
+### Current Direction
+
+Given these constraints, the project shifts toward a more practical design.
+
+Instead of relying on a fully learned world model, the system separates responsibilities:
+
+- the LLM handles high-level phase decisions
+- a memory module maintains a structured view of the environment
+- a rule-based planner handles low-level execution
+
+This design is more limited in generality, but more stable in practice.
+
+---
+
+### Summary
+
+This project explores how to structure an agent when:
+
+- the environment is partially observable
+- the representation is imperfect
+- and a general world model is not yet available
+
+The goal is not to provide a general solution, but to study a workable intermediate design.
+
+---
+
+## Overview
+
+This repository studies a practical agent architecture for partially observable, multi-stage tasks.
+
+Instead of using a single policy to handle everything, the system separates:
+
+- state representation
+- memory construction
+- high-level phase planning
+- low-level execution
+
+The current environment is a key-door-goal grid world, used as a controlled testbed for this architecture.
+
+```mermaid
+flowchart TD
+    A[Environment Observation] --> B[State Encoder]
+    B --> C[World Memory]
+    C --> D[LLM Planner: Phase Decision]
+    C --> E[Rule Planner: Execution Policy]
+    D --> E
+    E --> F[Skill Executor]
+    F --> G[Environment]
+    G --> A
+
+    C --> H[Monitor]
+    H --> D
+    H --> E
 ```
-Observation (z_t)
-    ↓
-Memory Update
-    ↓
-Planner Selection
-    ├── Fast Planner (Rule + Predictor)
-    └── Slow Planner (LLM)
-    ↓
-Action Execution
-    ↓
-Environment Feedback
+
+This architecture separates high-level reasoning from low-level control.  
+The LLM selects the current phase, while the rule planner handles execution.
+
+---
+
+## Architecture
+
+At the task level, the environment follows a structured dependency:
+
+the agent must first obtain the key, then handle the door, and finally reach the goal.
+
+```mermaid
+flowchart LR
+    A[find_key] --> B[go_to_door]
+    B --> C[search_goal]
+    C --> D[go_to_goal]
 ```
+
+These phases guide behavior but do not directly produce actions.  
+The execution layer is responsible for movement and interaction.
+
+---
+
+### Core flow
+
+`observation -> encoding -> memory update -> phase decision -> skill execution -> repeat`
+
+---
 
 ### Components
 
-* **Agent Loop**
+#### 1. State Encoder
+Converts observations into structured state:
+- agent position
+- local walls
+- visible objects
+- inventory state
 
-  * Maintains memory
-  * Handles decision flow
-  * Supports debug logging
+#### 2. World Memory
+Stores:
+- visited positions
+- known map structure
+- object locations
+- visit statistics
 
-* **Fast Planner (Predictive Rule)**
+Also supports:
+- BFS path planning
+- frontier exploration
+- loop detection
 
-  * Heuristic scoring
-  * One-step prediction rollout
-  * Loop avoidance
+#### 3. LLM Planner
+- outputs high-level phase only
+- does NOT control movement
 
-* **Slow Planner (LLM-based)**
+#### 4. Rule Planner
+Handles:
+- path following
+- exploration
+- local decision making
 
-  * Prompt-based decision making
-  * Uses memory + local context
-  * Designed for higher-level reasoning
+#### 5. Skill Executor
+Executes:
+- move
+- scan
+- escape_loop
 
-* **Predictor**
-
-  * Estimates next state
-  * Provides local transition hints
-
----
-
-##  Experiment Setup (V4)
-
-* Environment: `15x15 Grid`
-* Seeds: `0–19 (fixed)`
-* Max steps: fixed per episode
-* Comparison:
-
-| Planner                | Description           |
-| ---------------------- | --------------------- |
-| fast_predictive_legacy | heuristic + predictor |
-| llm_slow               | LLM-assisted planning |
-
----
-
-##  Results
-
-### LLM Slow Planner
-
-* Success Rate: **0.90**
-* Avg Steps (success): **86.78**
-
-### Fast Predictive (Legacy)
-
-* Success Rate: **1.00**
-* Avg Steps (success): **97.35**
+#### 6. Monitor
+Tracks:
+- failure
+- loops
+- key events (key pickup, door open)
 
 ---
 
-##  Key Findings
+### Design principle
 
-* The **predictive rule-based planner remains more stable** (100% success).
-* The **LLM planner achieves lower average steps** on successful runs.
-* However, LLM fails on harder long-horizon cases.
-
-### Conclusion
-
-> LLM does not outperform heuristic + predictive planning in low-level navigation tasks.
-
-Instead, it shows potential in:
-
-* reducing path length
-* making more direct decisions (when correct)
+- LLM → decides what to do
+- Rule system → decides how to do it
 
 ---
 
-##  Limitations
+## Environment
 
-* LLM is used in a **single-step decision mode**
-* No multi-step planning or rollout
-* No uncertainty modeling
-* Environment is still **pure navigation (no task abstraction)**
+Grid-world environment with:
 
----
-
-##  Next Direction (V5)
-
-The next version will shift from:
-
-```
-Navigation Problem → Task Execution Problem
-```
-
-Planned upgrades:
-
-* Skill-based action space
-* Task-oriented environment (e.g., key-door interactions)
-* Multi-step planning (rollout)
-* Improved world model (predictor V2)
+- partial observability
+- key-door-goal dependency
+- walls and obstacles
 
 ---
 
-##  How to Run
+## Results
+
+| Setting | Success Rate | Average Steps |
+|--------|-------------:|--------------:|
+| 10x10, 7x7 view | 1.00 | 25.65 |
+| 15x15, 7x7 view | 0.90 | 74.56 |
+
+---
+
+## Training (Predictor)
+
+Includes scripts for:
+
+- dataset collection
+- MLP predictor training
+
+Used for optional model-based planning.
+
+---
+
+## How to Run
 
 ```bash
 python -m run.run_agent
 ```
 
-To analyze results:
+---
 
-```bash
-python visual/analyze_results.py
-```
+## Project Structure
+
+- agent/
+- planner/
+- memory/
+- encoder/
+- skills/
+- env/
+- monitor/
+- run/
+- scripts/
+- visual/
 
 ---
 
-##  Project Structure (simplified)
+## Future Work
 
-```
-agent/
-encoder/
-memory/
-skill/
-scripts/
-monitor/
-run/
-planner/
-predictor/
-env/
-run/
-visual/
-```
-
----
-
-##  Version History
-
-* V1: Basic rule-based agent
-* V2: Memory + improved heuristics
-* V3: Predictor integration
-* V4: LLM + predictive hybrid comparison
-
----
-
-##  Author
-
-Sean Hsu
-AI Developer — Reinforcement Learning × LLM Systems
-
----
-"# WorldModel_agent" 
+- stronger world models
+- larger environments
+- multi-step prediction
+- learned execution policies
