@@ -1,5 +1,9 @@
 #  WorldModel_Agent V4 
+<<<<<<< HEAD
   — LLM + Predictive Hybrid Planner
+=======
+    -LLM + Predictive Hybrid Planner
+>>>>>>> 4d40fd0457489a2a1c535c2849b09071f01cfaea
 
 ##  Overview
 

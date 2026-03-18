@@ -13,32 +13,33 @@ import numpy as np
 # =========================
 # Experiment config
 # =========================
-PLANNER_MODE = "fast_predictive_legacy"
+PLANNER_MODE = "llm_slow"   # "rule" / "fast_predictive_legacy" / "llm_slow"
+
 MAZE_SIZE = 15
-WALL_PROB = 0.3
+WALL_PROB = 0.12
 VIEW_RADIUS = 3
-MAX_STEPS = 400
+MAX_STEPS = 200
 SLEEP_TIME = 0.0001
 
 MODEL_PATH = r"D:\models\qwen\Qwen2.5-3B-Instruct"
 
 # controlled seeds
-SEEDS = list(range(20))   # 先縮小，debug完再放大
+SEEDS = list(range(20))
 
 # =========================
 # Logging / debug config
 # =========================
-DEBUG_VERBOSE = True
-DEBUG_SEEDS = {0, 1, 2}   # 只對這幾個 seed 開完整 step log
+DEBUG_VERBOSE = False
+DEBUG_SEEDS = {0, 1, 2, 3}
 
-# 如果你之後要正式 benchmark：
+# benchmark mode example:
 # DEBUG_VERBOSE = False
 # DEBUG_SEEDS = set()
 
 # =========================
 # Output folder config
 # =========================
-OUTPUT_SUBDIR = "fast_predictive_legacy_15x15_seeded_debug"
+OUTPUT_SUBDIR = "llm_slow_v5a_15x15_2"
 
 
 # =========================
@@ -80,7 +81,7 @@ def build_planner():
         print("[Run] Using LLMPlanner as SLOW planner")
         return LLMPlanner(
             model_path=MODEL_PATH,
-            max_new_tokens=24,   # 先降，速度會快很多
+            max_new_tokens=24,
             temperature=0.0,
             do_sample=False,
             verbose=False,
@@ -107,7 +108,7 @@ def main() -> None:
 
     all_results = []
 
-    # 🔥 IMPORTANT: build once, reuse across seeds
+    # build once, reuse across seeds
     planner = build_planner()
 
     for seed in SEEDS:

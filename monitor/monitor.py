@@ -1,13 +1,13 @@
 class Monitor:
     """
-    PO-friendly runtime monitor.
+    V5-a task-world runtime monitor.
 
     Responsibilities:
     - stop if goal is reached
     - trigger replanning on failed movement
     - detect oscillation / getting stuck
     - optionally trigger replanning on prediction mismatch
-    - avoid relying on always-available goal_distance
+    - remain compatible with key / door / goal task world schema
     """
 
     def __init__(
@@ -35,38 +35,74 @@ class Monitor:
     ):
         """
         Decide whether to continue current behavior, replan, or stop.
-
-        Inputs:
-        - z_t: current latent state
-        - memory: WorldMemory instance
-        - last_info: last env step info
-        - prediction_signal: optional dict like {"total_error": ...}
         """
         agent_pos = z_t["agent_pos"]
-        goal_visible = z_t["goal_visible"]
-        visible_goal_pos = z_t["goal_pos"]
+        goal_visible = z_t.get("goal_visible", False)
+        visible_goal_pos = z_t.get("visible_goal_pos", None)
 
         memory_summary = memory.get_summary()
-        known_goal_pos = memory_summary["known_goal_pos"]
+        known_goal_pos = memory_summary.get("known_goal_pos", None)
+        has_key = bool(memory_summary.get("has_key", False))
+        known_door_pos = memory_summary.get("known_door_pos", None)
 
+        loop_hints = memory.get_loop_hints()
+        oscillation_pair = loop_hints.get("oscillation_pair")
+        repeat_count_current_pos = loop_hints.get(
+            "repeat_count_current_pos", 0)
+
+        # --------------------------------------------------
         # 1) Goal reached
-        # Case A: goal currently visible and agent is on it
+        # --------------------------------------------------
         if goal_visible and visible_goal_pos is not None and agent_pos == visible_goal_pos:
             return {"decision": "STOP", "reason": "goal_reached_visible"}
 
-        # Case B: goal was seen before and memory knows where it is
-        if known_goal_pos is not None and agent_pos == known_goal_pos:
-            return {"decision": "STOP", "reason": "goal_reached_memory"}
+        if known_goal_pos is not None:
+            known_goal_pos = tuple(known_goal_pos)
+            if agent_pos == known_goal_pos:
+                return {"decision": "STOP", "reason": "goal_reached_memory"}
 
-        # 2) Last action failed: wall hit / boundary hit
-        if (
-            last_info
-            and self.replan_on_wall_hit
-            and (last_info.get("hit_wall") or last_info.get("out_of_bounds"))
-        ):
-            return {"decision": "REPLAN", "reason": "movement_failed"}
+        # --------------------------------------------------
+        # 2) Immediate phase-switch replans
+        # --------------------------------------------------
+        if last_info is not None:
+            if last_info.get("picked_key", False):
+                return {"decision": "REPLAN", "reason": "picked_key_phase_change"}
 
-        # 3) Repeated movement / oscillation
+            if last_info.get("opened_door", False):
+                return {"decision": "REPLAN", "reason": "opened_door_phase_change"}
+
+        # --------------------------------------------------
+        # 3) Last action failed
+        # --------------------------------------------------
+        if last_info and self.replan_on_wall_hit:
+            if (
+                last_info.get("hit_wall")
+                or last_info.get("out_of_bounds")
+                or last_info.get("blocked_by_locked_door")
+            ):
+                return {"decision": "REPLAN", "reason": "movement_failed"}
+
+         # --------------------------------------------------
+        # 4) Early oscillation detection
+        # --------------------------------------------------
+        if oscillation_pair is not None:
+            if not has_key:
+                return {"decision": "REPLAN", "reason": "oscillation_before_key"}
+
+            if has_key and known_goal_pos is not None:
+                return {"decision": "REPLAN", "reason": "oscillation_after_goal_known"}
+
+            if has_key and known_door_pos is not None:
+                return {"decision": "REPLAN", "reason": "oscillation_after_key"}
+
+            return {"decision": "REPLAN", "reason": "oscillation_detected"}
+
+        # Current cell repeated too much very recently
+        if repeat_count_current_pos >= 3:
+            return {"decision": "REPLAN", "reason": "high_repeat_current_pos"}
+        # --------------------------------------------------
+        # 5) Repeated movement / oscillation (coarser stuck detector)
+        # --------------------------------------------------
         if (
             self.replan_on_stuck
             and memory.is_stuck_by_repetition(
@@ -74,12 +110,19 @@ class Monitor:
                 min_window=self.stuck_min_window,
             )
         ):
-            # If goal has been seen before, say so in the reason.
-            if known_goal_pos is not None:
-                return {"decision": "REPLAN", "reason": "stuck_after_goal_known"}
-            return {"decision": "REPLAN", "reason": "stuck_repetition"}
+            if not has_key and memory_summary.get("known_key_pos") is not None:
+                return {"decision": "REPLAN", "reason": "stuck_before_key"}
 
-        # 4) Prediction mismatch
+            if has_key and memory_summary.get("known_goal_pos") is not None:
+                return {"decision": "REPLAN", "reason": "stuck_after_goal_known"}
+
+            if has_key and memory_summary.get("known_door_pos") is not None:
+                return {"decision": "REPLAN", "reason": "stuck_after_key"}
+
+            return {"decision": "REPLAN", "reason": "stuck_repetition"}
+        # --------------------------------------------------
+        # 6) Prediction mismatch
+        # --------------------------------------------------
         if (
             self.replan_on_prediction_mismatch
             and prediction_signal is not None

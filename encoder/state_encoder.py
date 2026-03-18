@@ -1,19 +1,21 @@
 class StateEncoder:
     """
-    Convert raw environment observation into latent state representation.
+    V5-a Task World Encoder
 
-    PO v1 encoder:
-    - accepts partial observation from MazeEnv
-    - does NOT assume global goal is always known
-    - keeps structured latent state for planner / memory / predictor refactor
+    Convert raw environment observation into structured latent state.
 
     Expected observation schema:
     {
         "pos": (r, c),
         "walls": {"up": bool, "down": bool, "left": bool, "right": bool},
         "local_view": [[...], [...], [...]],
-        "goal_visible": bool,
-        "visible_goal_pos": (gr, gc) or None,
+        "visible_objects": [
+            {"type": "KEY", "pos": (r, c)},
+            {"type": "DOOR_LOCKED", "pos": (r, c)},
+            {"type": "DOOR_OPEN", "pos": (r, c)},
+            {"type": "GOAL", "pos": (r, c)},
+        ],
+        "inventory": {"has_key": bool},
         "step_count": int,
         "view_radius": int,
     }
@@ -23,48 +25,60 @@ class StateEncoder:
         pass
 
     def encode(self, obs: dict) -> dict:
-        """
-        Convert environment observation -> latent state z_t
-        """
         self._validate_obs(obs)
 
         r, c = obs["pos"]
         walls = obs["walls"]
         local_view = obs["local_view"]
-        goal_visible = obs["goal_visible"]
-        visible_goal_pos = obs["visible_goal_pos"]
+        visible_objects = obs["visible_objects"]
+        inventory = obs["inventory"]
         step_count = obs["step_count"]
         view_radius = obs["view_radius"]
 
-        if goal_visible and visible_goal_pos is not None:
-            gr, gc = visible_goal_pos
-            dx = gc - c
-            dy = gr - r
-            goal_distance = abs(dx) + abs(dy)
-            goal_pos = (gr, gc)
-        else:
-            dx = None
-            dy = None
-            goal_distance = None
-            goal_pos = None
+        has_key = bool(inventory.get("has_key", False))
+
+        visible_key_pos = None
+        visible_door_pos = None
+        visible_door_open = None
+        visible_goal_pos = None
+
+        for item in visible_objects:
+            obj_type = item["type"]
+            obj_pos = tuple(item["pos"])
+
+            if obj_type == "KEY" and visible_key_pos is None:
+                visible_key_pos = obj_pos
+
+            elif obj_type in ("DOOR_LOCKED", "DOOR_OPEN") and visible_door_pos is None:
+                visible_door_pos = obj_pos
+                visible_door_open = (obj_type == "DOOR_OPEN")
+
+            elif obj_type == "GOAL" and visible_goal_pos is None:
+                visible_goal_pos = obj_pos
 
         z_t = {
             "agent_pos": (r, c),
 
-            # PO-related goal fields
-            "goal_visible": goal_visible,
-            "goal_pos": goal_pos,
-
-            # Only defined when goal is visible
-            "dx": dx,
-            "dy": dy,
-            "goal_distance": goal_distance,
-
-            # Local partial observation
+            # local geometry
             "local_walls": walls,
             "local_view": local_view,
 
-            # Metadata
+            # planner-friendly object information
+            "visible_objects": visible_objects,
+
+            "has_key": has_key,
+
+            "key_visible": visible_key_pos is not None,
+            "visible_key_pos": visible_key_pos,
+
+            "door_visible": visible_door_pos is not None,
+            "visible_door_pos": visible_door_pos,
+            "visible_door_open": visible_door_open,
+
+            "goal_visible": visible_goal_pos is not None,
+            "visible_goal_pos": visible_goal_pos,
+
+            # metadata
             "step_count": step_count,
             "view_radius": view_radius,
         }
@@ -72,15 +86,12 @@ class StateEncoder:
         return z_t
 
     def _validate_obs(self, obs: dict) -> None:
-        """
-        Basic schema validation for PO observations.
-        """
         required_keys = {
             "pos",
             "walls",
             "local_view",
-            "goal_visible",
-            "visible_goal_pos",
+            "visible_objects",
+            "inventory",
             "step_count",
             "view_radius",
         }
@@ -99,20 +110,32 @@ class StateEncoder:
         for k in ("up", "down", "left", "right"):
             if k not in obs["walls"]:
                 raise KeyError(f'obs["walls"] missing key: "{k}"')
+            if not isinstance(obs["walls"][k], bool):
+                raise ValueError(f'obs["walls"]["{k}"] must be a bool')
 
         if not isinstance(obs["local_view"], list):
             raise ValueError('obs["local_view"] must be a 2D list')
 
-        if not isinstance(obs["goal_visible"], bool):
-            raise ValueError('obs["goal_visible"] must be a bool')
+        if not isinstance(obs["visible_objects"], list):
+            raise ValueError('obs["visible_objects"] must be a list')
 
-        if obs["visible_goal_pos"] is not None:
-            if (
-                not isinstance(obs["visible_goal_pos"], tuple)
-                or len(obs["visible_goal_pos"]) != 2
-            ):
-                raise ValueError(
-                    'obs["visible_goal_pos"] must be None or tuple (gr, gc)')
+        for item in obs["visible_objects"]:
+            if not isinstance(item, dict):
+                raise ValueError('each visible object must be a dict')
+            if "type" not in item or "pos" not in item:
+                raise KeyError(
+                    'each visible object must contain "type" and "pos"')
+            if not isinstance(item["type"], str):
+                raise ValueError('visible object "type" must be a string')
+            if not isinstance(item["pos"], tuple) or len(item["pos"]) != 2:
+                raise ValueError('visible object "pos" must be a tuple (r, c)')
+
+        if not isinstance(obs["inventory"], dict):
+            raise ValueError('obs["inventory"] must be a dict')
+        if "has_key" not in obs["inventory"]:
+            raise KeyError('obs["inventory"] missing key: "has_key"')
+        if not isinstance(obs["inventory"]["has_key"], bool):
+            raise ValueError('obs["inventory"]["has_key"] must be a bool')
 
         if not isinstance(obs["step_count"], int):
             raise ValueError('obs["step_count"] must be an int')
