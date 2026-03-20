@@ -3,12 +3,193 @@ from memory.world_memory import WorldMemory
 from monitor.monitor import Monitor
 from planner.rule_planner import RulePlanner
 from skills.skill_executor import SkillExecutor
+from planner.predictive_planner_v8 import PredictivePlannerV8
 
 import time
 
 
+class PhaseController:
+    """
+    Thin adapter:
+    - LLM decides current PHASE
+    - fast planner executes that phase
+    - recover phase is handled here using loop-aware local escape
+    """
+
+    DIR_TO_DELTA = {
+        "UP": (-1, 0),
+        "DOWN": (1, 0),
+        "LEFT": (0, -1),
+        "RIGHT": (0, 1),
+    }
+
+    def __init__(self, executor_planner=None):
+        self.executor_planner = executor_planner or RulePlanner()
+
+    def choose_skill(
+        self,
+        phase_decision: dict | None,
+        z_t: dict,
+        memory_summary: dict,
+        planner_context: dict,
+        decision: str,
+        last_info: dict | None,
+    ) -> dict:
+        phase = None
+        phase_reason = None
+
+        if phase_decision is not None:
+            phase = phase_decision.get("phase", None)
+            phase_reason = phase_decision.get("reason", None)
+
+        planner_context = dict(planner_context or {})
+        planner_context["forced_phase"] = phase
+        planner_context["phase_reason"] = phase_reason
+
+        # -------------------------------------------------
+        # Hard recover stays outside fast planner
+        # -------------------------------------------------
+        if phase == "recover":
+            return self._choose_recover_skill(
+                z_t=z_t,
+                memory_summary=memory_summary,
+                planner_context=planner_context,
+                last_info=last_info,
+            )
+
+        return self.executor_planner.choose_skill(
+            z_t=z_t,
+            memory_summary=memory_summary,
+            memory_patch=planner_context.get("memory_patch"),
+            frontier_candidates=planner_context.get("frontier_candidates"),
+            loop_hints=planner_context.get("loop_hints"),
+            planner_context=planner_context,
+            replan=(decision == "REPLAN"),
+            last_info=last_info,
+        )
+
+    def _choose_recover_skill(
+        self,
+        z_t: dict,
+        memory_summary: dict,
+        planner_context: dict,
+        last_info: dict | None,
+    ) -> dict:
+        """
+        Recovery policy:
+        1. Avoid moving back into oscillation pair cells if possible
+        2. Prefer legal neighbors with lower visit counts
+        3. Prefer not to immediately reverse the last action
+        4. If no safe move exists, fall back to scan
+        """
+        agent_pos = tuple(z_t["agent_pos"])
+        walls = z_t["local_walls"]
+        loop_hints = planner_context.get("loop_hints", {}) or {}
+
+        oscillation_pair = loop_hints.get("oscillation_pair", None)
+        recent_positions = loop_hints.get("recent_positions", []) or []
+
+        banned_positions = set()
+        if oscillation_pair is not None:
+            for p in oscillation_pair:
+                banned_positions.add(tuple(p))
+
+        visit_counts = memory_summary.get("visit_counts", {}) or {}
+
+        last_action = None
+        if last_info is not None:
+            last_action = last_info.get("action", None)
+            if isinstance(last_action, str):
+                last_action = last_action.upper()
+
+        reverse_of_last = {
+            "UP": "DOWN",
+            "DOWN": "UP",
+            "LEFT": "RIGHT",
+            "RIGHT": "LEFT",
+        }.get(last_action, None)
+
+        candidates = []
+
+        for direction, (dr, dc) in self.DIR_TO_DELTA.items():
+            wall_key = direction.lower()
+            if walls.get(wall_key, False):
+                continue
+
+            next_pos = (agent_pos[0] + dr, agent_pos[1] + dc)
+
+            score = 0.0
+
+            # Strong penalty: do not stay inside oscillation pair if avoidable
+            if next_pos in banned_positions:
+                score -= 100.0
+            else:
+                score += 20.0
+
+            # Penalize immediate reverse of last action
+            if reverse_of_last is not None and direction == reverse_of_last:
+                score -= 15.0
+
+            # Penalize revisits
+            score -= 2.0 * float(visit_counts.get(next_pos, 0))
+
+            # Prefer positions not in recent positions
+            if next_pos not in [tuple(p) for p in recent_positions]:
+                score += 8.0
+
+            # Mild preference for unexplored / less visited area
+            if visit_counts.get(next_pos, 0) == 0:
+                score += 5.0
+
+            candidates.append((score, direction, next_pos))
+
+        if not candidates:
+            return {"skill": "scan", "args": {}}
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_direction, best_next_pos = candidates[0]
+
+        # If every legal move still stays inside the same oscillation trap, scan instead
+        if best_next_pos in banned_positions and len(candidates) == 1:
+            return {"skill": "scan", "args": {}}
+
+        # If top choice is still inside banned pair but there exists an outside option, use outside option
+        for score, direction, next_pos in candidates:
+            if next_pos not in banned_positions:
+                return {
+                    "skill": "move",
+                    "args": {"direction": direction},
+                }
+
+        # Otherwise use the best available move
+        return {
+            "skill": "move",
+            "args": {"direction": best_direction},
+        }
+
+
 class AgentLoop:
-    def __init__(self, env, planner=None, sleep_time=0.0, verbose=True):
+    """
+    V5-b phase-based agent loop.
+
+    Core split:
+    - slow planner (LLM): choose / update PHASE only
+    - fast planner (RulePlanner): execute phase using BFS / frontier exploration
+    - executor: still executes primitive skills
+
+    Design goal:
+    - remove LLM from primitive move selection
+    - keep RulePlanner as robust execution backbone
+    """
+
+    def __init__(
+        self,
+        env,
+        fast_planner=None,
+        slow_planner=None,
+        sleep_time=0.0,
+        verbose=True,
+    ):
         self.env = env
         self.verbose = verbose
 
@@ -20,53 +201,35 @@ class AgentLoop:
             stuck_min_window=6,
             replan_on_wall_hit=True,
             replan_on_stuck=True,
-            replan_on_prediction_mismatch=True,
-            prediction_error_threshold=4.0,
+            replan_on_prediction_mismatch=False,
+            prediction_error_threshold=9999.0,
         )
 
-        # -----------------------------
-        # Dual planner setup
-        # -----------------------------
-        self.fast_planner = RulePlanner()
+        # ---------------------------------
+        # Dual planner split
+        # ---------------------------------
+        self.fast_planner = fast_planner if fast_planner is not None else RulePlanner()
+        self.slow_planner = slow_planner
 
-        # If planner is provided and is NOT RulePlanner, treat it as slow planner
-        # (typically LLMPlanner). If planner is None, slow planner stays disabled.
-        if planner is None:
-            self.slow_planner = None
-        elif isinstance(planner, RulePlanner):
-            self.fast_planner = planner
-            self.slow_planner = None
-        else:
-            self.slow_planner = planner
-
+        self.phase_controller = PhaseController(
+            executor_planner=self.fast_planner
+        )
         self.executor = SkillExecutor()
 
-        # Predictor is optional for now because the old predictor may still
-        # depend on the pre-PO latent schema.
+        # Predictor disabled in AgentLoop itself.
+        # Predictor lives inside fast planner (e.g. PredictivePlannerV8).
         self.predictor = None
         self.predictor_enabled = False
 
-        try:
-            from predictor.mlp_predictor import MLPPredictor
-
-            self.predictor = MLPPredictor(
-                checkpoint_path="predictor/checkpoints/jepa_lite_mlp_po_v2.pt"
-            )
-            self.predictor_enabled = True
-
-            if self.verbose:
-                print("[AgentLoop] Predictor loaded successfully.")
-        except Exception as e:
-            self.predictor = None
-            self.predictor_enabled = False
-            if self.verbose:
-                print(f"[AgentLoop] Predictor disabled: {e}")
+        if self.verbose:
+            print("[AgentLoop] Predictor disabled.")
+            print("[AgentLoop] V5-b mode: LLM decides PHASE, fast planner executes.")
 
         self.current_skill = None
         self.current_skill_steps = 0
-
-        # Keep small because V3 macro skills already compress multiple steps.
         self.max_cached_skill_steps = 1
+
+        self.current_phase_decision = None
 
         self.sleep_time = sleep_time
 
@@ -75,9 +238,12 @@ class AgentLoop:
         self.fast_planner_calls = 0
         self.scan_count = 0
 
-        # Routing state:
-        # count consecutive local failures before escalating to slow planner.
+        # routing state
         self.consecutive_local_failures = 0
+
+    # =========================================================
+    # Skill cache validity
+    # =========================================================
 
     def _cached_skill_is_still_valid(self, z_t):
         if self.current_skill is None:
@@ -87,7 +253,6 @@ class AgentLoop:
         skill_args = self.current_skill.get("args", {})
         walls = z_t["local_walls"]
 
-        # Primitive move validity
         if skill_name == "move":
             direction = skill_args.get("direction", "").lower()
             if direction not in walls:
@@ -96,88 +261,14 @@ class AgentLoop:
                 return False
             return True
 
-        # Macro move validity:
-        # only keep cached if the first direction is still open.
-        if skill_name in {"move_k_steps", "move_until_blocked"}:
-            direction = skill_args.get("direction", "").lower()
-            if direction not in walls:
-                return False
-            if walls[direction]:
-                return False
-            return True
-
-        # scan / escape_loop should usually be one-shot skills
         if skill_name in {"scan", "escape_loop"}:
             return False
 
-        return True
+        return False
 
-    def _safe_abs_diff(self, a, b):
-        if a is None or b is None:
-            return 0.0
-        return abs(a - b)
-
-    def _compute_prediction_signal(self, z_hat, z_real):
-        """
-        PO-safe prediction comparison.
-
-        Since PO latent may contain None for:
-        - goal_pos
-        - dx
-        - dy
-        - goal_distance
-
-        we only compare fields when they are available.
-        """
-        pos_mismatch = int(z_hat.get("agent_pos") != z_real.get("agent_pos"))
-
-        goal_distance_error = self._safe_abs_diff(
-            z_hat.get("goal_distance"), z_real.get("goal_distance")
-        )
-        dx_error = self._safe_abs_diff(z_hat.get("dx"), z_real.get("dx"))
-        dy_error = self._safe_abs_diff(z_hat.get("dy"), z_real.get("dy"))
-
-        goal_visible_mismatch = int(
-            z_hat.get("goal_visible", False) != z_real.get(
-                "goal_visible", False)
-        )
-
-        wall_mismatch = 0
-        comparable_wall_count = 0
-
-        pred_walls = z_hat.get("local_walls", {})
-        real_walls = z_real.get("local_walls", {})
-
-        for k in ["up", "down", "left", "right"]:
-            pred_v = pred_walls.get(k)
-            real_v = real_walls.get(k)
-
-            if pred_v is None or real_v is None:
-                continue
-
-            comparable_wall_count += 1
-            if pred_v != real_v:
-                wall_mismatch += 1
-
-        total_error = (
-            2.0 * pos_mismatch
-            + 1.0 * goal_distance_error
-            + 0.5 * dx_error
-            + 0.5 * dy_error
-            + 0.5 * goal_visible_mismatch
-            + 0.5 * wall_mismatch
-        )
-
-        return {
-            "pos_mismatch": pos_mismatch,
-            "goal_distance_error": goal_distance_error,
-            "dx_error": dx_error,
-            "dy_error": dy_error,
-            "goal_visible_mismatch": goal_visible_mismatch,
-            "wall_mismatch": wall_mismatch,
-            "comparable_wall_count": comparable_wall_count,
-            "total_error": total_error,
-        }
+    # =========================================================
+    # Slow planner routing (phase updates only)
+    # =========================================================
 
     def _should_use_slow_planner(
         self,
@@ -187,124 +278,129 @@ class AgentLoop:
         last_info,
     ):
         """
-        Event-triggered slow planner.
-
-        Important distinction:
-        - REPLAN means "pick a new skill"
-        - SLOW means "the situation is strategic enough to justify LLM cost"
-
-        Therefore, local failures stay in FAST by default, while major
-        information / phase changes escalate to SLOW.
+        Tight routing for V5-b / V8:
+        slow planner only updates high-level phase when phase-relevant events happen.
         """
+
         if self.slow_planner is None:
             return False
 
-        # 1) Just scanned: new information arrived.
-        if last_info is not None and last_info.get("scan", False):
+        # 0) episode start / no phase yet
+        if self.current_phase_decision is None:
             return True
 
-        # 2) First time goal becomes visible / known.
-        if (
-            z_t.get("goal_visible", False)
-            and memory_summary.get("seen_goal_count", 0) <= 1
-        ):
+        current_phase = self.current_phase_decision.get("phase", None)
+
+        # 1) explicit task phase transitions
+        if last_info is not None and last_info.get("picked_key", False):
             return True
 
-        # 3) Strong stuck / oscillation -> strategic reset.
+        if last_info is not None and last_info.get("opened_door", False):
+            return True
+
+        # 2) only update to goal phase when goal becomes relevant
+        #    goal visible alone is NOT enough before key / before open door
+        has_key = bool(z_t.get("has_key", False))
+        goal_visible = bool(z_t.get("goal_visible", False))
+        known_door_open = bool(memory_summary.get("known_door_open", False))
+        visible_door_open = bool(z_t.get("visible_door_open", False))
+        door_open = known_door_open or visible_door_open
+
+        if has_key and door_open and goal_visible and current_phase != "go_to_goal":
+            return True
+
+        # 3) hard stuck / oscillation
         if self.memory.is_stuck_by_repetition():
             return True
 
-        # 4) escape_loop is a meaningful high-level recovery skill.
+        loop_hints = self.memory.get_loop_hints()
+        if loop_hints.get("repeat_count_current_pos", 0) >= 3:
+            return True
+
+        if loop_hints.get("oscillation_pair") is not None:
+            return True
+
+        # 4) after escape_loop, let slow planner update phase again
         if (
             last_info is not None
             and last_info.get("macro_skill") == "escape_loop"
         ):
             return True
 
-        # 5) Escalate only after repeated local failures.
+        # 5) repeated local failures
         if self.consecutive_local_failures >= 2:
             return True
 
-        # Default: local replans remain inside FAST.
+        # 6) generic REPLAN alone does not always mean phase change
         return False
 
-    def _select_planner(
+    def _update_phase_if_needed(
         self,
-        z_t,
-        memory_summary,
-        decision,
-        last_info,
-    ):
-        use_slow = self._should_use_slow_planner(
-            z_t=z_t,
-            memory_summary=memory_summary,
-            decision=decision,
-            last_info=last_info,
-        )
-
-        if use_slow:
-            self.slow_planner_calls += 1
-            if self.verbose:
-                print("[Planner Routing] Using SLOW planner")
-            return self.slow_planner, "slow"
-
-        self.fast_planner_calls += 1
-        if self.verbose:
-            print("[Planner Routing] Using FAST planner")
-        return self.fast_planner, "fast"
-
-    def _build_planner_context(self, z_t):
-        """
-        Build V3 planner-facing structured memory context.
-        """
-        return self.memory.get_planner_context(
-            agent_pos=z_t["agent_pos"],
-            patch_radius=3,
-            top_k_frontiers=5,
-        )
-
-    def _choose_skill_with_compat(
-        self,
-        planner,
         z_t,
         memory_summary,
         planner_context,
         decision,
         last_info,
     ):
-        """
-        Backward-compatible planner call.
+        if not self._should_use_slow_planner(
+            z_t=z_t,
+            memory_summary=memory_summary,
+            decision=decision,
+            last_info=last_info,
+        ):
+            return
 
-        New V3 planners can accept:
-        - memory_patch
-        - frontier_candidates
-        - loop_hints
-        - planner_context
+        if self.slow_planner is None:
+            return
 
-        Old V2 planners may only accept:
-        - z_t
-        - memory_summary
-        - replan
-        - last_info
-        """
-        try:
-            return planner.choose_skill(
-                z_t=z_t,
-                memory_summary=memory_summary,
-                memory_patch=planner_context["memory_patch"],
-                frontier_candidates=planner_context["frontier_candidates"],
-                loop_hints=planner_context["loop_hints"],
-                planner_context=planner_context,
-                replan=(decision == "REPLAN"),
-                last_info=last_info,
+        self.slow_planner_calls += 1
+
+        if self.verbose:
+            print("[Planner Routing] Updating PHASE via SLOW planner")
+
+        self.current_phase_decision = self.slow_planner.choose_phase(
+            z_t=z_t,
+            memory_summary=memory_summary,
+            memory_patch=planner_context.get("memory_patch"),
+            frontier_candidates=planner_context.get("frontier_candidates"),
+            loop_hints=planner_context.get("loop_hints"),
+            planner_context=planner_context,
+            replan=(decision == "REPLAN"),
+            last_info=last_info,
+        )
+
+        if self.verbose:
+            print(
+                "[Phase Update]",
+                {
+                    "step": z_t["step_count"],
+                    "agent_pos": z_t["agent_pos"],
+                    "has_key": z_t["has_key"],
+                    "decision": decision,
+                    "last_info": {
+                        "picked_key": last_info.get("picked_key", False) if last_info else False,
+                        "opened_door": last_info.get("opened_door", False) if last_info else False,
+                        "hit_wall": last_info.get("hit_wall", False) if last_info else False,
+                        "blocked_by_locked_door": last_info.get("blocked_by_locked_door", False) if last_info else False,
+                    },
+                    "phase": self.current_phase_decision,
+                },
             )
-        except TypeError:
-            return planner.choose_skill(
-                z_t=z_t,
-                memory_summary=memory_summary,
-                replan=(decision == "REPLAN"),
-                last_info=last_info,
-            )
+    # =========================================================
+    # Planner context
+    # =========================================================
+
+    def _build_planner_context(self, z_t):
+        ctx = self.memory.get_planner_context(
+            agent_pos=z_t["agent_pos"],
+            patch_radius=3,
+            top_k_frontiers=5,
+        )
+        ctx["memory_obj"] = self.memory
+        return ctx
+    # =========================================================
+    # Skill invalidation
+    # =========================================================
 
     def _should_invalidate_after_execution(
         self,
@@ -319,9 +415,9 @@ class AgentLoop:
 
         Main principle:
         - scan / escape_loop are one-shot
-        - macro skills are one-shot by default
         - wall hit / OOB / monitor replan => invalidate
-        - newly visible goal => invalidate
+        - key pickup / door open => invalidate (phase change)
+        - goal visible newly discovered => invalidate
         """
         skill_name = skill_spec.get("skill", "")
 
@@ -334,50 +430,56 @@ class AgentLoop:
         if skill_name in {"scan", "escape_loop"}:
             return True
 
-        if skill_name in {"move_k_steps", "move_until_blocked"}:
+        if info.get("picked_key", False):
             return True
 
-        # If goal is newly seen after this transition, force replanning.
+        if info.get("opened_door", False):
+            return True
+
         if (
             z_tp1.get("goal_visible", False)
             and memory_summary_before_step.get("seen_goal_count", 0) == 0
         ):
             return True
 
-        # If macro skill reported short execution / interrupted execution,
-        # invalidate to let planner reconsider.
-        if info.get("macro_skill") in {"move_k_steps", "move_until_blocked"}:
-            requested_k = info.get("requested_k")
-            requested_max_k = info.get("requested_max_k")
-            actual_steps = info.get("actual_steps", 0)
-
-            if requested_k is not None and actual_steps < requested_k:
-                return True
-
-            if requested_max_k is not None and actual_steps < requested_max_k:
-                return True
-
         return False
 
+    # =========================================================
+    # Main run loop
+    # =========================================================
     def run(self, max_steps=200):
         obs_t = self.env.reset()
+        self.memory.reset()
+
         last_info = None
         self.consecutive_local_failures = 0
+        self.current_skill = None
+        self.current_skill_steps = 0
+        self.current_phase_decision = None
+
+        self.slow_planner_calls = 0
+        self.fast_planner_calls = 0
+        self.scan_count = 0
 
         if self.verbose:
             print("=== Agent Loop Start ===")
-            print(f"Fast Planner: {self.fast_planner.__class__.__name__}")
             print(
-                "Slow Planner:",
+                f"Fast Planner (executor): {self.fast_planner.__class__.__name__}")
+            print(
+                "Slow Planner (phase):",
                 self.slow_planner.__class__.__name__ if self.slow_planner is not None else "None",
             )
             print("Environment reset.\n")
             self.env.render()
 
+        final_step = 0
+
         for step in range(max_steps):
+            final_step = step + 1
+
             z_t = self.encoder.encode(obs_t)
 
-            # Update memory from current real observation.
+            # update memory from current real observation
             self.memory.update(z_t, last_info)
             memory_summary = self.memory.get_summary()
             planner_context = self._build_planner_context(z_t)
@@ -391,19 +493,44 @@ class AgentLoop:
 
             decision = monitor_result["decision"]
 
-            if self.verbose:
+            should_print_step_summary = (
+                step < 8
+                or step % 20 == 0
+                or monitor_result["decision"] == "REPLAN"
+                or (last_info is not None and last_info.get("picked_key", False))
+                or (last_info is not None and last_info.get("opened_door", False))
+                or step >= max_steps - 30
+            )
+
+            if self.verbose and should_print_step_summary:
                 print(f"[Step {step + 1}]")
-                print("z_t =", z_t)
-                print("memory_summary =", memory_summary)
-                print("memory_patch =", planner_context["memory_patch"])
-                print("frontier_candidates =",
-                      planner_context["frontier_candidates"])
+                print("agent_pos =", z_t["agent_pos"])
+                print("has_key =", z_t["has_key"])
+                print("visible_key_pos =", z_t.get("visible_key_pos"))
+                print("visible_door_pos =", z_t.get("visible_door_pos"))
+                print("visible_goal_pos =", z_t.get("visible_goal_pos"))
+                print("memory_known_key =", memory_summary.get("known_key_pos"))
+                print("memory_known_door =",
+                      memory_summary.get("known_door_pos"))
+                print("memory_known_door_open =",
+                      memory_summary.get("known_door_open"))
+                print("memory_known_goal =",
+                      memory_summary.get("known_goal_pos"))
                 print("loop_hints =", planner_context["loop_hints"])
                 print("monitor =", monitor_result)
-
+                print("current_phase_decision =", self.current_phase_decision)
             if decision == "STOP":
                 print("Monitor STOP:", monitor_result["reason"])
                 break
+
+            # update PHASE only when needed
+            self._update_phase_if_needed(
+                z_t=z_t,
+                memory_summary=memory_summary,
+                planner_context=planner_context,
+                decision=decision,
+                last_info=last_info,
+            )
 
             need_new_skill = (
                 self.current_skill is None
@@ -412,18 +539,11 @@ class AgentLoop:
                 or self.current_skill_steps >= self.max_cached_skill_steps
             )
 
-            planner_name = "cached"
-
             if need_new_skill:
-                planner_to_use, planner_name = self._select_planner(
-                    z_t=z_t,
-                    memory_summary=memory_summary,
-                    decision=decision,
-                    last_info=last_info,
-                )
+                self.fast_planner_calls += 1
 
-                self.current_skill = self._choose_skill_with_compat(
-                    planner=planner_to_use,
+                self.current_skill = self.phase_controller.choose_skill(
+                    phase_decision=self.current_phase_decision,
                     z_t=z_t,
                     memory_summary=memory_summary,
                     planner_context=planner_context,
@@ -432,133 +552,94 @@ class AgentLoop:
                 )
                 self.current_skill_steps = 0
 
-            skill_spec = self.current_skill
-
-            if skill_spec["skill"] == "scan":
-                self.scan_count += 1
-
-            if self.verbose:
-                print("planner_used =", planner_name)
-                print("chosen_skill =", skill_spec)
-
-            # Predictor branch (optional)
-            z_hat_tp1 = None
-            prediction_signal = None
-
-            if self.predictor_enabled and self.predictor is not None:
-                try:
-                    z_hat_tp1 = self.predictor.predict_next_state(
-                        z_t,
-                        skill_spec,
-                    )
-                except Exception as e:
-                    z_hat_tp1 = None
-                    prediction_signal = None
-                    if self.verbose:
-                        print(f"[AgentLoop] Predictor step skipped: {e}")
+                if self.verbose and should_print_step_summary:
+                    print("chosen_skill =", self.current_skill)
 
             execution_result = self.executor.execute(
-                self.env,
-                skill_spec,
-            )
+                self.env, self.current_skill)
+            self.current_skill_steps += 1
 
             obs_tp1 = execution_result["obs"]
             done = execution_result["done"]
             info = execution_result["info"]
 
-            z_tp1 = self.encoder.encode(obs_tp1)
+            if self.current_skill.get("skill") == "scan":
+                self.scan_count += 1
 
-            if z_hat_tp1 is not None:
-                try:
-                    prediction_signal = self._compute_prediction_signal(
-                        z_hat_tp1,
-                        z_tp1,
-                    )
-                except Exception as e:
-                    prediction_signal = None
-                    if self.verbose:
-                        print(f"[AgentLoop] Prediction compare skipped: {e}")
-
-            if self.verbose and prediction_signal is not None:
-                print(
-                    f"[Pred] z_hat={z_hat_tp1.get('agent_pos')} "
-                    f"z_real={z_tp1.get('agent_pos')} "
-                    f"err={prediction_signal}"
-                )
-
-            monitor_prediction = self.monitor.decide(
-                z_t=z_tp1,
-                memory=self.memory,
-                last_info=info,
-                prediction_signal=prediction_signal,
-            )
-
-            had_local_failure = bool(
-                info.get("hit_wall")
-                or info.get("out_of_bounds")
-                or monitor_prediction.get("reason") == "prediction_mismatch"
-            )
-            if had_local_failure:
+            if (
+                info.get("hit_wall", False)
+                or info.get("out_of_bounds", False)
+                or info.get("blocked_by_locked_door", False)
+            ):
                 self.consecutive_local_failures += 1
             else:
                 self.consecutive_local_failures = 0
 
+            z_tp1 = self.encoder.encode(obs_tp1)
+
             invalidate_skill = self._should_invalidate_after_execution(
-                skill_spec=skill_spec,
+                skill_spec=self.current_skill,
                 info=info,
                 z_tp1=z_tp1,
                 memory_summary_before_step=memory_summary,
-                monitor_prediction=monitor_prediction,
+                monitor_prediction=self.monitor.decide(
+                    z_t=z_tp1,
+                    memory=self.memory,
+                    last_info=info,
+                    prediction_signal=None,
+                ),
             )
 
             if invalidate_skill:
                 self.current_skill = None
-
-            if self.current_skill is None:
                 self.current_skill_steps = 0
-            else:
-                self.current_skill_steps += 1
 
-            if self.verbose:
-                print("execution_result =", execution_result)
+            if self.verbose and should_print_step_summary:
                 print(
-                    f"[Fast Layer] invalidate_skill = {invalidate_skill}, "
-                    f"current_skill_steps = {self.current_skill_steps}, "
-                    f"current_skill = {self.current_skill}, "
-                    f"consecutive_local_failures = {self.consecutive_local_failures}"
+                    "execution_info =",
+                    {
+                        "old_pos": info.get("old_pos"),
+                        "new_pos": info.get("new_pos"),
+                        "hit_wall": info.get("hit_wall"),
+                        "out_of_bounds": info.get("out_of_bounds"),
+                        "blocked_by_locked_door": info.get("blocked_by_locked_door"),
+                        "picked_key": info.get("picked_key"),
+                        "opened_door": info.get("opened_door"),
+                        "goal_reached": info.get("goal_reached"),
+                        "step_count": info.get("step_count"),
+                    },
                 )
-                self.env.render()
+                print(
+                    "[Fast Layer] invalidate_skill =",
+                    invalidate_skill,
+                    ", current_skill_steps =",
+                    self.current_skill_steps,
+                    ", current_skill =",
+                    self.current_skill,
+                    ", consecutive_local_failures =",
+                    self.consecutive_local_failures,
+                    sep="",
+                )
+                print("has_key:", z_tp1.get("has_key", False))
+                print(f"steps: {info.get('step_count', step + 1)}/{max_steps}")
+                print()
 
             obs_t = obs_tp1
             last_info = info
 
+            if done:
+                if info.get("goal_reached", False):
+                    if self.verbose:
+                        print("[Episode End] Goal reached.")
+                    return True, final_step
+
+                if self.verbose:
+                    print("[Episode End] Done without goal.")
+                return False, final_step
+
             if self.sleep_time > 0:
                 time.sleep(self.sleep_time)
 
-            if done:
-                if last_info is not None and last_info.get("goal_reached", False):
-                    print("Goal reached!")
-                else:
-                    print("Episode finished.")
-                break
-
         if self.verbose:
-            print("=== Agent Loop Finished ===")
-            final_z = self.encoder.encode(obs_t)
-            print("final_z =", final_z)
-
-            if last_info is not None and last_info.get("goal_reached", False):
-                print("Result: Goal reached!")
-            elif last_info is not None and last_info.get("max_steps_reached", False):
-                print("Result: Max steps reached.")
-            else:
-                print("Result: Stopped by monitor or loop ended.")
-
-        print(f"SLOW_PLANNER_CALLS: {self.slow_planner_calls}")
-        print(f"FAST_PLANNER_CALLS: {self.fast_planner_calls}")
-        print(f"SCAN_COUNT: {self.scan_count}")
-
-        if last_info is not None and last_info.get("goal_reached", False):
-            return True, step + 1
-        else:
-            return False, step + 1
+            print("[Episode End] Max steps reached.")
+        return False, final_step

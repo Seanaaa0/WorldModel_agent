@@ -13,15 +13,39 @@ from planner.rule_planner import RulePlanner
 
 
 class LLMPlanner(BasePlanner):
+    """
+    V5-b LLM PHASE planner.
+
+    Important:
+    - LLM does NOT choose primitive moves anymore.
+    - LLM only decides the current high-level phase.
+    - RulePlanner remains the robust execution engine.
+
+    Output schema:
+    {
+      "phase": "find_key" | "go_to_door" | "search_goal" | "go_to_goal" | "recover",
+      "target": "key" | "door" | "goal" | null,
+      "reason": "..."
+    }
+    """
+
+    VALID_PHASES = {
+        "find_key",
+        "go_to_door",
+        "search_goal",
+        "go_to_goal",
+        "recover",
+    }
+
     def __init__(
         self,
         model_path: str,
-        max_new_tokens: int = 48,
+        max_new_tokens: int = 80,
         temperature: float = 0.0,
         do_sample: bool = False,
         verbose: bool = True,
         predictor_checkpoint: str = "predictor/checkpoints/jepa_lite_mlp_po_v2.pt",
-        use_predictor_hint: bool = True,
+        use_predictor_hint: bool = False,
     ) -> None:
         self.model_path = model_path
         self.max_new_tokens = max_new_tokens
@@ -33,8 +57,6 @@ class LLMPlanner(BasePlanner):
         self.predictor = None
         self.predictor_enabled = False
 
-        # Temporary fallback.
-        # Later this can be replaced by a dedicated fast policy.
         self.fallback_planner = RulePlanner()
 
         if self.verbose:
@@ -74,7 +96,7 @@ class LLMPlanner(BasePlanner):
             print("first_param_device =", next(self.model.parameters()).device)
             print("[LLMPlanner] 4-bit model loaded successfully.")
 
-        # Optional predictor hint
+        # kept for compatibility; currently not used in V5-b
         if self.use_predictor_hint:
             try:
                 from predictor.mlp_predictor import MLPPredictor
@@ -91,7 +113,11 @@ class LLMPlanner(BasePlanner):
                 if self.verbose:
                     print(f"[LLMPlanner] Predictor hint disabled: {e}")
 
-    def choose_skill(
+    # =========================================================
+    # Public API
+    # =========================================================
+
+    def choose_phase(
         self,
         z_t: dict,
         memory_summary: Optional[dict] = None,
@@ -106,12 +132,7 @@ class LLMPlanner(BasePlanner):
         memory_patch = memory_patch or []
         frontier_candidates = frontier_candidates or []
         loop_hints = loop_hints or {}
-
-        predictor_hints = self._build_predictor_hints(
-            z_t=z_t,
-            memory_summary=memory_summary,
-            last_info=last_info,
-        )
+        planner_context = planner_context or {}
 
         system_prompt = self._build_system_prompt()
         user_prompt = self._build_user_prompt(
@@ -120,80 +141,139 @@ class LLMPlanner(BasePlanner):
             memory_patch=memory_patch,
             frontier_candidates=frontier_candidates,
             loop_hints=loop_hints,
-            predictor_hints=predictor_hints,
             replan=replan,
             last_info=last_info,
         )
 
         try:
             raw_text = self._generate(system_prompt, user_prompt)
-            skill_spec = self._parse_and_validate(raw_text)
-            skill_spec = self._postprocess_skill(
-                skill_spec=skill_spec,
+            phase_decision = self._parse_and_validate_phase(raw_text)
+            phase_decision = self._postprocess_phase(
+                phase_decision=phase_decision,
                 z_t=z_t,
                 memory_summary=memory_summary,
-                frontier_candidates=frontier_candidates,
                 loop_hints=loop_hints,
                 last_info=last_info,
             )
 
             if self.verbose:
-                print("[LLMPlanner] predictor_hints =", predictor_hints)
-                print("[LLMPlanner] raw_response =", raw_text)
-                print("[LLMPlanner] parsed_skill =", skill_spec)
+                print("[LLMPlanner] raw_phase_response =", raw_text)
+                print("[LLMPlanner] parsed_phase =", phase_decision)
 
-            return skill_spec
+            return phase_decision
 
         except Exception as e:
             if self.verbose:
-                print(f"[LLMPlanner] fallback to RulePlanner due to: {e}")
+                print(f"[LLMPlanner] fallback to heuristic phase due to: {e}")
 
-            return self.fallback_planner.choose_skill(
+            return self._fallback_phase_decision(
                 z_t=z_t,
                 memory_summary=memory_summary,
-                memory_patch=memory_patch,
-                frontier_candidates=frontier_candidates,
                 loop_hints=loop_hints,
-                replan=replan,
                 last_info=last_info,
             )
 
+    # backward compatibility
+    def choose_skill(
+        self,
+        z_t: dict,
+        memory_summary: Optional[dict] = None,
+        memory_patch: Optional[list] = None,
+        frontier_candidates: Optional[list] = None,
+        loop_hints: Optional[dict] = None,
+        planner_context: Optional[dict] = None,
+        replan: bool = False,
+        last_info: dict | None = None,
+    ) -> dict:
+        """
+        Backward-compat bridge:
+        if old code still calls choose_skill on this class,
+        convert phase decision into forced_phase and let RulePlanner execute.
+        """
+        phase_decision = self.choose_phase(
+            z_t=z_t,
+            memory_summary=memory_summary,
+            memory_patch=memory_patch,
+            frontier_candidates=frontier_candidates,
+            loop_hints=loop_hints,
+            planner_context=planner_context,
+            replan=replan,
+            last_info=last_info,
+        )
+
+        planner_context = dict(planner_context or {})
+        planner_context["forced_phase"] = phase_decision.get("phase")
+        planner_context["phase_reason"] = phase_decision.get("reason")
+
+        return self.fallback_planner.choose_skill(
+            z_t=z_t,
+            memory_summary=memory_summary or {},
+            memory_patch=memory_patch or [],
+            frontier_candidates=frontier_candidates or [],
+            loop_hints=loop_hints or {},
+            planner_context=planner_context,
+            replan=replan,
+            last_info=last_info,
+        )
+
+    # =========================================================
+    # Prompt construction
+    # =========================================================
+
     def _build_system_prompt(self) -> str:
-        return """You are the slow-layer strategic planner for a maze agent in a partially observable environment.
+        return """You are the slow-layer PHASE planner for a partially observable grid-world task.
 
-Your job is to choose exactly one next skill.
+Your responsibility:
+- decide what high-level phase the agent should be in
+- do NOT choose primitive movement actions
+- do NOT do pathfinding
+- low-level navigation and exploration are handled by another execution system
 
-Allowed skills:
-1. move
-2. scan
-3. escape_loop
+Possible world objects may include:
+- KEY
+- DOOR (locked or open)
+- GOAL
+- WALLS
+
+The overall task may require:
+- finding a prerequisite object
+- reaching a blocking object
+- searching for a final target
+- reaching the final target
+
+Available phases:
+1. find_key
+   - use when the key is required and has not been collected yet
+2. go_to_door
+   - use when key is already collected and the door should be reached next
+3. search_goal
+   - use when the door is open but the goal location is still unknown
+4. go_to_goal
+   - use when the goal location is known and should be reached
+5. recover
+   - use when the agent is clearly stuck or looping and needs recovery behavior
 
 Return ONLY one valid JSON object.
 Do not output markdown.
 Do not output code fences.
-Do not output explanation.
-Do not output extra text before or after JSON.
+Do not output explanation outside JSON.
 
-Valid JSON formats:
-{"skill":"move","args":{"direction":"up"}}
-{"skill":"move","args":{"direction":"down"}}
-{"skill":"move","args":{"direction":"left"}}
-{"skill":"move","args":{"direction":"right"}}
-{"skill":"scan","args":{}}
-{"skill":"escape_loop","args":{}}
+Valid output format:
+{"phase":"find_key","target":"key","reason":"..."}
+{"phase":"go_to_door","target":"door","reason":"..."}
+{"phase":"search_goal","target":"goal","reason":"..."}
+{"phase":"go_to_goal","target":"goal","reason":"..."}
+{"phase":"recover","target":null,"reason":"..."}
 
-Critical decision rules:
-- You are a slow-layer planner, not a per-step reflex controller.
-- Use move for the next local step when a safe direction is clear.
-- Use scan when new perception is needed or exploration is uncertain.
-- Use escape_loop when the agent is stuck in repeated positions.
-- Never choose a direction that is currently blocked by a wall.
-- If the previous move hit a wall, do not choose the same direction again.
-- If a known goal position exists, prefer moving toward that remembered goal.
-- If the goal is not known, use frontier information and memory_patch for exploration.
-- Avoid repeated scan unless there is clear uncertainty or lack of progress.
-- If predictor_hints are available, use them as one-step decision aids.
-- Predictor hints are advisory, not mandatory.
+Important:
+- If the agent is clearly stuck, choose recover.
+- If the key is not yet collected, prefer find_key.
+- After the key is collected, the door must be handled before the final goal can be pursued.
+- If the key is collected and the door is not open yet:
+  - prefer go_to_door if the door location is known
+  - otherwise still prefer go_to_door as the next objective (the execution layer will explore to find it)
+- Only choose go_to_goal when the goal is known AND the door is already open.
+- If the door is open and the goal is not known, prefer search_goal.
 """
 
     def _build_user_prompt(
@@ -203,133 +283,280 @@ Critical decision rules:
         memory_patch: list,
         frontier_candidates: list,
         loop_hints: dict,
-        predictor_hints: dict,
         replan: bool,
         last_info: dict | None,
     ) -> str:
-        walls = z_t.get("local_walls", {})
-        blocked_directions = [
-            d for d in ["up", "down", "left", "right"]
-            if walls.get(d, False)
-        ]
-        open_directions = [
-            d for d in ["up", "down", "left", "right"]
-            if not walls.get(d, False)
-        ]
+        has_key = bool(z_t.get("has_key", False))
+
+        visible_key_pos = z_t.get("visible_key_pos", None)
+        visible_door_pos = z_t.get("visible_door_pos", None)
+        visible_goal_pos = z_t.get("visible_goal_pos", None)
+        visible_door_open = z_t.get("visible_door_open", None)
+
+        known_key_pos = memory_summary.get("known_key_pos", None)
+        known_door_pos = memory_summary.get("known_door_pos", None)
+        known_goal_pos = memory_summary.get("known_goal_pos", None)
+        known_door_open = memory_summary.get("known_door_open", None)
 
         last_failed_action = None
         if last_info is not None and (
             last_info.get("hit_wall", False)
             or last_info.get("out_of_bounds", False)
+            or last_info.get("blocked_by_locked_door", False)
         ):
             last_failed_action = str(last_info.get("action", "")).lower()
 
-        planner_meta = {
-            "replan": replan,
-            "just_scanned": bool(last_info is not None and last_info.get("scan", False)),
-            "hit_wall_recently": bool(last_info is not None and last_info.get("hit_wall", False)),
-            "out_of_bounds_recently": bool(last_info is not None and last_info.get("out_of_bounds", False)),
-            "goal_reached_recently": bool(last_info is not None and last_info.get("goal_reached", False)),
-            "last_failed_action": last_failed_action,
-            "blocked_directions": blocked_directions,
-            "open_directions": open_directions,
-        }
-
         payload = {
-            "latent_state": z_t,
-            "memory_summary": memory_summary,
+            "task_manual": {
+                "possible_objects": ["KEY", "DOOR_LOCKED", "DOOR_OPEN", "GOAL", "WALL"],
+                "planner_role": "Decide the current high-level phase only. Do not choose primitive actions.",
+            },
+            "latent_state": {
+                "agent_pos": z_t.get("agent_pos"),
+                "has_key": has_key,
+                "key_visible": z_t.get("key_visible", False),
+                "visible_key_pos": visible_key_pos,
+                "door_visible": z_t.get("door_visible", False),
+                "visible_door_pos": visible_door_pos,
+                "visible_door_open": visible_door_open,
+                "goal_visible": z_t.get("goal_visible", False),
+                "visible_goal_pos": visible_goal_pos,
+                "local_walls": z_t.get("local_walls", {}),
+            },
+            "memory_summary": {
+                "known_key_pos": known_key_pos,
+                "known_door_pos": known_door_pos,
+                "known_door_open": known_door_open,
+                "known_goal_pos": known_goal_pos,
+                "visited_count": memory_summary.get("visited_count", 0),
+                "recent_positions": memory_summary.get("recent_positions", []),
+            },
+            "loop_hints": loop_hints,
+            "replan": replan,
+            "recent_events": {
+                "picked_key_recently": bool(last_info is not None and last_info.get("picked_key", False)),
+                "opened_door_recently": bool(last_info is not None and last_info.get("opened_door", False)),
+                "hit_wall_recently": bool(last_info is not None and last_info.get("hit_wall", False)),
+                "out_of_bounds_recently": bool(last_info is not None and last_info.get("out_of_bounds", False)),
+                "blocked_by_locked_door_recently": bool(last_info is not None and last_info.get("blocked_by_locked_door", False)),
+                "last_failed_action": last_failed_action,
+            },
             "memory_patch": memory_patch,
             "frontier_candidates": frontier_candidates[:5],
-            "loop_hints": loop_hints,
-            "predictor_hints": predictor_hints,
-            "planner_context": planner_meta,
-            "task": (
-                "Choose exactly one next skill for strategic replanning. "
-                "Use memory_patch for spatial reasoning, use frontier_candidates for exploration, "
-                "use loop_hints to avoid oscillation, and use predictor_hints as one-step rollout aids."
+            "instruction": (
+                "Choose the best current PHASE. "
+                "Do not output primitive moves. "
+                "Use recover only when the agent is clearly stuck or looping."
             ),
-            "output_requirement": "Return valid JSON only.",
         }
 
         payload = self._json_safe(payload)
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
-    def _build_predictor_hints(
+    # =========================================================
+    # Parsing / validation
+    # =========================================================
+
+    def _parse_and_validate_phase(self, raw_text: str) -> dict:
+        json_obj = self._extract_json(raw_text)
+
+        if "phase" not in json_obj:
+            raise ValueError("Missing 'phase' field")
+
+        phase = str(json_obj["phase"]).strip().lower()
+        if phase not in self.VALID_PHASES:
+            raise ValueError(f"Invalid phase: {phase}")
+
+        target = json_obj.get("target", None)
+        if target is not None:
+            target = str(target).strip().lower()
+            if target not in {"key", "door", "goal"}:
+                target = None
+
+        reason = str(json_obj.get("reason", "")).strip()
+
+        return {
+            "phase": phase,
+            "target": target,
+            "reason": reason,
+        }
+
+    def _extract_json(self, raw_text: str) -> dict:
+        raw_text = raw_text.strip()
+
+        try:
+            return json.loads(raw_text)
+        except json.JSONDecodeError:
+            pass
+
+        start = raw_text.find("{")
+        if start == -1:
+            raise ValueError("No JSON object found in model output")
+
+        depth = 0
+        for i in range(start, len(raw_text)):
+            ch = raw_text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = raw_text[start:i + 1]
+                    return json.loads(candidate)
+
+        raise ValueError("No complete JSON object found in model output")
+
+    # =========================================================
+    # Postprocess / fallback
+    # =========================================================
+
+    def _postprocess_phase(
+        self,
+        phase_decision: dict,
+        z_t: dict,
+        memory_summary: dict,
+        loop_hints: dict,
+        last_info: dict | None,
+    ) -> dict:
+        # hard stuck always recover
+        if loop_hints.get("is_stuck", False):
+            return {
+                "phase": "recover",
+                "target": None,
+                "reason": "loop_hints indicates the agent is stuck",
+            }
+
+        if loop_hints.get("oscillation_pair") is not None:
+            return {
+                "phase": "recover",
+                "target": None,
+                "reason": "oscillation detected",
+            }
+
+        # sanitize with hard world constraints
+        has_key = bool(z_t.get("has_key", False))
+        known_goal_pos = memory_summary.get("known_goal_pos", None)
+        known_door_pos = memory_summary.get("known_door_pos", None)
+        known_door_open = memory_summary.get("known_door_open", None)
+        visible_goal_pos = z_t.get("visible_goal_pos", None)
+        visible_door_pos = z_t.get("visible_door_pos", None)
+        visible_door_open = z_t.get("visible_door_open", None)
+
+        goal_known = (visible_goal_pos is not None) or (
+            known_goal_pos is not None)
+        door_known = (visible_door_pos is not None) or (
+            known_door_pos is not None)
+        door_open = (visible_door_open is True) or (known_door_open is True)
+
+        phase = phase_decision["phase"]
+
+        if not has_key:
+            if phase in {"go_to_door", "search_goal", "go_to_goal"}:
+                return {
+                    "phase": "find_key",
+                    "target": "key",
+                    "reason": "key has not been collected yet",
+                }
+
+        if has_key and not door_open:
+            if phase in {"go_to_goal", "search_goal"}:
+                return {
+                    "phase": "go_to_door",
+                    "target": "door",
+                    "reason": "door-first correction before pursuing goal",
+                }
+
+            if phase == "go_to_door":
+                return {
+                    "phase": "go_to_door",
+                    "target": "door",
+                    "reason": "key collected and door not open yet",
+                }
+
+        if has_key and door_open and not goal_known:
+            if phase == "go_to_door":
+                return {
+                    "phase": "search_goal",
+                    "target": "goal",
+                    "reason": "door already open and goal not known",
+                }
+
+        if goal_known and phase == "search_goal":
+            return {
+                "phase": "go_to_goal",
+                "target": "goal",
+                "reason": "goal is already known",
+            }
+
+        return phase_decision
+
+    def _fallback_phase_decision(
         self,
         z_t: dict,
         memory_summary: dict,
+        loop_hints: dict,
         last_info: dict | None,
     ) -> dict:
-        if not self.predictor_enabled or self.predictor is None:
+        if loop_hints.get("is_stuck", False) or loop_hints.get("oscillation_pair") is not None:
             return {
-                "enabled": False,
-                "candidate_rollouts": {}
+                "phase": "recover",
+                "target": None,
+                "reason": "fallback: stuck or oscillation",
             }
 
-        walls = z_t.get("local_walls", {})
-        recent_positions = memory_summary.get("recent_positions", [])
-        recent_set = set(tuple(p) for p in recent_positions[-6:])
+        has_key = bool(z_t.get("has_key", False))
 
-        last_failed_direction = None
-        if last_info is not None and (
-            last_info.get("hit_wall", False) or last_info.get(
-                "out_of_bounds", False)
-        ):
-            last_failed_direction = str(last_info.get("action", "")).lower()
+        visible_key_pos = z_t.get("visible_key_pos", None)
+        visible_door_pos = z_t.get("visible_door_pos", None)
+        visible_goal_pos = z_t.get("visible_goal_pos", None)
+        visible_door_open = z_t.get("visible_door_open", None)
 
-        candidate_rollouts = {}
+        known_key_pos = memory_summary.get("known_key_pos", None)
+        known_door_pos = memory_summary.get("known_door_pos", None)
+        known_goal_pos = memory_summary.get("known_goal_pos", None)
+        known_door_open = memory_summary.get("known_door_open", None)
 
-        for direction in ["up", "down", "left", "right"]:
-            if walls.get(direction, False):
-                candidate_rollouts[direction] = {
-                    "available": False,
-                    "reason": "blocked_now",
-                }
-                continue
-
-            if last_failed_direction is not None and direction == last_failed_direction:
-                candidate_rollouts[direction] = {
-                    "available": False,
-                    "reason": "same_as_recent_failed_direction",
-                }
-                continue
-
-            skill_spec = {
-                "skill": "move",
-                "args": {"direction": direction.upper()},
+        key_known = (visible_key_pos is not None) or (
+            known_key_pos is not None)
+        door_known = (visible_door_pos is not None) or (
+            known_door_pos is not None)
+        goal_known = (visible_goal_pos is not None) or (
+            known_goal_pos is not None)
+        door_open = (visible_door_open is True) or (known_door_open is True)
+        if not has_key:
+            return {
+                "phase": "find_key",
+                "target": "key",
+                "reason": "fallback: key not collected yet",
             }
 
-            try:
-                z_hat = self.predictor.predict_next_state(z_t, skill_spec)
-            except Exception as e:
-                candidate_rollouts[direction] = {
-                    "available": False,
-                    "reason": f"predictor_error: {str(e)}",
-                }
-                continue
+        # -----------------------------
+        # HARD RULE:
+        # once key is collected, door must be handled before goal pursuit
+        # -----------------------------
 
-            pred_pos = tuple(z_hat.get("agent_pos", z_t["agent_pos"]))
-            pred_goal_visible = z_hat.get("goal_visible", False)
-            pred_goal_distance = z_hat.get("goal_distance", None)
-            pred_dx = z_hat.get("dx", None)
-            pred_dy = z_hat.get("dy", None)
-            pred_local_walls = z_hat.get("local_walls", {})
+        if not door_open:
+            return {
+                "phase": "go_to_door",
+                "target": "door",
+                "reason": "fallback: key collected, door not open yet",
+            }
 
-            candidate_rollouts[direction] = {
-                "available": True,
-                "predicted_agent_pos": pred_pos,
-                "predicted_goal_visible": pred_goal_visible,
-                "predicted_goal_distance": pred_goal_distance,
-                "predicted_dx": pred_dx,
-                "predicted_dy": pred_dy,
-                "predicted_local_walls": pred_local_walls,
-                "predicted_recent_repeat": pred_pos in recent_set,
+        if goal_known:
+            return {
+                "phase": "go_to_goal",
+                "target": "goal",
+                "reason": "fallback: goal is known and door is already open",
             }
 
         return {
-            "enabled": True,
-            "candidate_rollouts": candidate_rollouts,
+            "phase": "search_goal",
+            "target": "goal",
+            "reason": "fallback: door open, goal unknown",
         }
+    # =========================================================
+    # Generation
+    # =========================================================
 
     def _generate(self, system_prompt: str, user_prompt: str) -> str:
         messages = [
@@ -367,116 +594,9 @@ Critical decision rules:
         ).strip()
         return raw_text
 
-    def _parse_and_validate(self, raw_text: str) -> dict:
-        json_obj = self._extract_json(raw_text)
-
-        if "skill" not in json_obj:
-            raise ValueError("Missing 'skill' field")
-
-        skill = str(json_obj["skill"]).strip().lower()
-        args = json_obj.get("args", {})
-
-        if skill == "scan":
-            if not isinstance(args, dict):
-                raise ValueError("scan args must be a dict")
-            return {"skill": "scan", "args": {}}
-
-        if skill == "escape_loop":
-            if not isinstance(args, dict):
-                raise ValueError("escape_loop args must be a dict")
-            return {"skill": "escape_loop", "args": {}}
-
-        if skill == "move":
-            if not isinstance(args, dict):
-                raise ValueError("move args must be a dict")
-
-            direction = str(args.get("direction", "")).strip().lower()
-            if direction not in {"up", "down", "left", "right"}:
-                raise ValueError(f"Invalid move direction: {direction}")
-
-            return {
-                "skill": "move",
-                "args": {"direction": direction.upper()},
-            }
-
-        raise ValueError(f"Unknown skill: {skill}")
-
-    def _extract_json(self, raw_text: str) -> dict:
-        raw_text = raw_text.strip()
-
-        try:
-            return json.loads(raw_text)
-        except json.JSONDecodeError:
-            pass
-
-        start = raw_text.find("{")
-        if start == -1:
-            raise ValueError("No JSON object found in model output")
-
-        depth = 0
-        for i in range(start, len(raw_text)):
-            ch = raw_text[i]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = raw_text[start:i + 1]
-                    return json.loads(candidate)
-
-        raise ValueError("No complete JSON object found in model output")
-
-    def _postprocess_skill(
-        self,
-        skill_spec: dict,
-        z_t: dict,
-        memory_summary: dict,
-        frontier_candidates: list,
-        loop_hints: dict,
-        last_info: dict | None,
-    ) -> dict:
-        walls = z_t.get("local_walls", {})
-
-        # hard stuck -> escape_loop
-        if loop_hints.get("is_stuck", False):
-            return {"skill": "escape_loop", "args": {}}
-
-        if skill_spec["skill"] == "move":
-            chosen = skill_spec["args"]["direction"].lower()
-            if self._direction_is_unsafe(chosen, walls, last_info):
-                replacement = self._choose_safe_direction(
-                    z_t=z_t,
-                    memory_summary=memory_summary,
-                    avoid_direction=self._last_failed_direction(last_info),
-                )
-                if replacement is None:
-                    return {"skill": "scan", "args": {}}
-                return {"skill": "move", "args": {"direction": replacement.upper()}}
-            return skill_spec
-
-        return skill_spec
-
-    def _last_failed_direction(self, last_info: dict | None) -> str | None:
-        if last_info is None:
-            return None
-        if last_info.get("hit_wall") or last_info.get("out_of_bounds"):
-            return str(last_info.get("action", "")).strip().lower()
-        return None
-
-    def _direction_is_unsafe(
-        self,
-        direction: str,
-        walls: dict,
-        last_info: dict | None,
-    ) -> bool:
-        if walls.get(direction, False):
-            return True
-
-        last_failed_action = self._last_failed_direction(last_info)
-        if last_failed_action is not None and direction == last_failed_action:
-            return True
-
-        return False
+    # =========================================================
+    # Utils
+    # =========================================================
 
     def _json_safe(self, obj):
         if isinstance(obj, dict):
@@ -500,73 +620,3 @@ Critical decision rules:
             return [self._json_safe(x) for x in obj]
 
         return obj
-
-    def _choose_safe_direction(
-        self,
-        z_t: dict,
-        memory_summary: dict,
-        avoid_direction: str | None = None,
-    ) -> str | None:
-        walls = z_t.get("local_walls", {})
-        r, c = z_t["agent_pos"]
-
-        recent_positions = memory_summary.get("recent_positions", [])
-        recent_set = set(tuple(p) for p in recent_positions[-4:])
-
-        known_goal_pos = memory_summary.get("known_goal_pos", None)
-
-        candidates = []
-
-        if known_goal_pos is not None:
-            gr, gc = tuple(known_goal_pos)
-
-            if gr < r:
-                candidates.append("up")
-            elif gr > r:
-                candidates.append("down")
-
-            if gc < c:
-                candidates.append("left")
-            elif gc > c:
-                candidates.append("right")
-
-        for d in ["up", "right", "down", "left"]:
-            if d not in candidates:
-                candidates.append(d)
-
-        candidates = [d for d in candidates if not walls.get(d, False)]
-
-        if avoid_direction is not None:
-            filtered = [d for d in candidates if d != avoid_direction]
-            if filtered:
-                candidates = filtered
-
-        if not candidates:
-            return None
-
-        fresh_candidates = []
-        for d in candidates:
-            nr, nc = self._simulate_move(r, c, d)
-            if (nr, nc) not in recent_set:
-                fresh_candidates.append(d)
-
-        if fresh_candidates:
-            candidates = fresh_candidates
-
-        return candidates[0]
-
-    def _simulate_move(
-        self,
-        row: int,
-        col: int,
-        direction: str,
-    ) -> tuple[int, int]:
-        if direction == "up":
-            return (row - 1, col)
-        if direction == "down":
-            return (row + 1, col)
-        if direction == "left":
-            return (row, col - 1)
-        if direction == "right":
-            return (row, col + 1)
-        return (row, col)

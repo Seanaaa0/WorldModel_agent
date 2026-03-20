@@ -1,139 +1,199 @@
-#  WorldModel_Agent V4 
-  — LLM + Predictive Hybrid Planner
-
-##  Overview
-
-Maze Agent V4 is a hybrid decision-making system that integrates:
-
-* **Rule-based planning (fast, stable)**
-* **Predictive model (local rollout)**
-* **LLM-based slow planner (global reasoning attempt)**
-
-The goal of this version is to evaluate whether a language model can improve decision quality in a partially observable navigation task.
+# WorldModel Agent V6
+Fast–Slow Maze Agent with LLM Phase Planning + Predictive Execution
 
 ---
 
-##  Architecture
+## Overview
 
+Maze Agent V6 is a **fast–slow hybrid agent system** designed to study decision-making under partial observability.
+
+Unlike previous versions that mixed decision layers, V6 introduces a **clean separation between:**
+
+- **Slow planner (LLM)** → phase-level reasoning
+- **Fast planner (Predictive)** → local action execution
+
+This version serves as a **final toy testbed** validating that architecture.
+
+---
+
+## Core Idea
+
+Instead of letting LLM choose every action, we enforce:
+
+```text
+LLM → "what to do"
+Fast planner → "how to do it"
 ```
-Observation (z_t)
+
+This avoids:
+
+- unstable token-level control
+- poor handling of latent state
+- excessive LLM dependency
+
+---
+
+## Architecture
+
+```text
+Environment
+    ↓
+State Encoder (z_t)
     ↓
 Memory Update
     ↓
-Planner Selection
-    ├── Fast Planner (Rule + Predictor)
-    └── Slow Planner (LLM)
+Monitor (event detection)
     ↓
-Action Execution
+Slow Planner (LLM, phase-level, event-driven)
+    ↓
+Phase Controller
+    ↓
+Fast Planner (PredictivePlannerV8)
+    ↓
+Skill Execution
     ↓
 Environment Feedback
 ```
 
-### Components
+---
 
-* **Agent Loop**
+## Components
 
-  * Maintains memory
-  * Handles decision flow
-  * Supports debug logging
+### Agent Loop
+- Orchestrates the full pipeline
+- Handles monitor-triggered replanning
+- Maintains phase state
 
-* **Fast Planner (Predictive Rule)**
+### Monitor
+- Detects key events:
+  - picked key
+  - opened door
+  - stuck / oscillation
+- Triggers **slow replanning only when needed**
 
-  * Heuristic scoring
-  * One-step prediction rollout
-  * Loop avoidance
+### Slow Planner (LLM)
+- Outputs **phase-level decisions**
+- Examples:
+  - `find_key`
+  - `go_to_door`
+  - `search_goal`
+  - `go_to_goal`
+  - `recover`
+- Not used for primitive actions
 
-* **Slow Planner (LLM-based)**
+### Fast Planner (PredictivePlannerV8)
+- Local action selection
+- Uses:
+  - memory
+  - frontier exploration
+  - predictor-guided evaluation
+- Executes behavior conditioned on the current phase
 
-  * Prompt-based decision making
-  * Uses memory + local context
-  * Designed for higher-level reasoning
+### Predictor
+- One-step state prediction
+- Provides local rollout signals
+- Used as a **decision aid**, not a full planning engine
 
-* **Predictor**
-
-  * Estimates next state
-  * Provides local transition hints
+### Recover System
+- First-class control mode
+- Loop-aware escape mechanism
+- Handles oscillation / stuck cases
 
 ---
 
-##  Experiment Setup (V4)
+## Experiment Setup (V6)
 
-* Environment: `15x15 Grid`
-* Seeds: `0–19 (fixed)`
-* Max steps: fixed per episode
-* Comparison:
-
-| Planner                | Description           |
-| ---------------------- | --------------------- |
-| fast_predictive_legacy | heuristic + predictor |
-| llm_slow               | LLM-assisted planning |
+- Environment: `20x20 Grid`
+- Wall probability: `0.12`
+- View radius: `3`
+- Max steps: `300`
+- Mode: `predictive_v8_llm_phase`
 
 ---
 
-##  Results
+## Results
 
-### LLM Slow Planner
+### 20 Seeds
+- Success: **20 / 20**
+- Success rate: **1.00**
 
-* Success Rate: **0.90**
-* Avg Steps (success): **86.78**
-
-### Fast Predictive (Legacy)
-
-* Success Rate: **1.00**
-* Avg Steps (success): **97.35**
-
----
-
-##  Key Findings
-
-* The **predictive rule-based planner remains more stable** (100% success).
-* The **LLM planner achieves lower average steps** on successful runs.
-* However, LLM fails on harder long-horizon cases.
-
-### Conclusion
-
-> LLM does not outperform heuristic + predictive planning in low-level navigation tasks.
-
-Instead, it shows potential in:
-
-* reducing path length
-* making more direct decisions (when correct)
+### 100 Seeds
+- Success: **98 / 100**
+- Success rate: **0.98**
+- Avg steps (success): **~100.8**
 
 ---
 
-##  Limitations
+## Key Findings
 
-* LLM is used in a **single-step decision mode**
-* No multi-step planning or rollout
-* No uncertainty modeling
-* Environment is still **pure navigation (no task abstraction)**
+### 1. Fast–Slow separation works
+- LLM is effective at **phase planning**
+- Fast planner is more reliable for **execution**
+
+### 2. Event-driven replanning is critical
+- Continuous LLM usage is unnecessary
+- Monitor-triggered replanning is sufficient and efficient
+
+### 3. Recover must be explicit
+- Recovery is not optional
+- Loop-aware control significantly improves robustness
+
+### 4. Predictor is useful but limited
+- Improves local decisions
+- Not sufficient as a full planning engine
 
 ---
 
-##  Next Direction (V5)
+## Failure Analysis
 
-The next version will shift from:
+Remaining failures (2/100):
 
+- Rare local navigation edge cases
+- Exploration coverage issues
+
+These are **tail cases**, not architecture failures.
+
+---
+
+## Why This Version Stops Here
+
+This project has achieved its goal as a **toy fast–slow architecture validation**.
+
+Key questions answered:
+
+- Can LLM operate at phase level instead of action level? → Yes
+- Can the fast planner handle execution reliably? → Yes
+- Can monitor-driven replanning work? → Yes
+- Is recovery necessary? → Yes
+
+Further improvements would mostly involve **overfitting rare seeds**, which is not the goal.
+
+---
+
+## Next Direction
+
+Shift from:
+
+```text
+Maze Navigation → Real Task Environment
 ```
-Navigation Problem → Task Execution Problem
-```
 
-Planned upgrades:
+Future work:
 
-* Skill-based action space
-* Task-oriented environment (e.g., key-door interactions)
-* Multi-step planning (rollout)
-* Improved world model (predictor V2)
+- tool / task-based environment
+- richer state semantics
+- multi-step planning / rollout
+- integration with learned world models (e.g., JEPA)
 
 ---
 
-##  How to Run
+## How to Run
 
 ```bash
 python -m run.run_agent
 ```
 
-To analyze results:
+Analyze results:
 
 ```bash
 python visual/analyze_results.py
@@ -141,18 +201,16 @@ python visual/analyze_results.py
 
 ---
 
-##  Project Structure (simplified)
+## Project Structure (simplified)
 
-```
+```text
 agent/
 encoder/
 memory/
-skill/
-scripts/
 monitor/
-run/
 planner/
 predictor/
+skill/
 env/
 run/
 visual/
@@ -160,19 +218,17 @@ visual/
 
 ---
 
-##  Version History
+## Version History
 
-* V1: Basic rule-based agent
-* V2: Memory + improved heuristics
-* V3: Predictor integration
-* V4: LLM + predictive hybrid comparison
-
----
-
-##  Author
-
-Sean Hsu
-AI Developer — Reinforcement Learning × LLM Systems
+- V1: Rule-based agent
+- V2: Memory + heuristics
+- V3: Predictor integration
+- V4: LLM vs Predictive comparison
+- V5: Phase-based planning (initial)
+- V6: **Fast–Slow architecture (final toy version)**
 
 ---
-"# WorldModel_agent" 
+
+## Author
+
+Sean Hsu  

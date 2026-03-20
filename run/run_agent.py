@@ -3,6 +3,7 @@ from agent.agent_loop import AgentLoop
 from planner.rule_planner import RulePlanner
 from planner.predictive_rule_planner import PredictiveRulePlanner
 from planner.llm_planner import LLMPlanner
+from planner.predictive_planner_v8 import PredictivePlannerV8
 
 import random
 import os
@@ -13,32 +14,35 @@ import numpy as np
 # =========================
 # Experiment config
 # =========================
-PLANNER_MODE = "fast_predictive_legacy"
-MAZE_SIZE = 15
-WALL_PROB = 0.3
+
+# "rule" / "fast_predictive_legacy" / "predictive_v8" / "llm_slow" / "predictive_v8_llm_phase"
+PLANNER_MODE = "predictive_v8_llm_phase"
+
+MAZE_SIZE = 20
+WALL_PROB = 0.12
 VIEW_RADIUS = 3
-MAX_STEPS = 400
+MAX_STEPS = 300
 SLEEP_TIME = 0.0001
 
 MODEL_PATH = r"D:\models\qwen\Qwen2.5-3B-Instruct"
 
 # controlled seeds
-SEEDS = list(range(20))   # 先縮小，debug完再放大
-
+SEEDS = [51]
+#
 # =========================
 # Logging / debug config
 # =========================
 DEBUG_VERBOSE = True
-DEBUG_SEEDS = {0, 1, 2}   # 只對這幾個 seed 開完整 step log
+DEBUG_SEEDS = {51}
 
-# 如果你之後要正式 benchmark：
+# benchmark mode example:
 # DEBUG_VERBOSE = False
 # DEBUG_SEEDS = set()
 
 # =========================
 # Output folder config
 # =========================
-OUTPUT_SUBDIR = "fast_predictive_legacy_15x15_seeded_debug"
+OUTPUT_SUBDIR = "predictive_llm_v8_20x20_1"
 
 
 # =========================
@@ -75,40 +79,86 @@ def set_seed(seed):
 # =========================
 # Planner builder
 # =========================
-def build_planner():
-    if PLANNER_MODE == "llm_slow":
-        print("[Run] Using LLMPlanner as SLOW planner")
-        return LLMPlanner(
+
+def build_planners():
+    if PLANNER_MODE == "predictive_v8_llm_phase":
+        print(
+            "[Run] Using PredictivePlannerV8 as FAST planner + LLMPlanner as SLOW planner")
+
+        fast_planner = PredictivePlannerV8(
+            predictor_checkpoint="predictor/checkpoints/mlp_predictor_v7.pt",
+            verbose=False,
+        )
+
+        slow_planner = LLMPlanner(
             model_path=MODEL_PATH,
-            max_new_tokens=24,   # 先降，速度會快很多
+            max_new_tokens=24,
             temperature=0.0,
             do_sample=False,
             verbose=False,
         )
 
-    if PLANNER_MODE == "fast_predictive_legacy":
-        print("[Run] Using PredictiveRulePlanner")
-        return PredictiveRulePlanner(
-            predictor_checkpoint="predictor/checkpoints/jepa_lite_mlp_po_v2.pt",
-            use_predictor=True,
+        return fast_planner, slow_planner
+
+    if PLANNER_MODE == "predictive_v8":
+        print("[Run] Using PredictivePlannerV8 only (FAST only, no slow planner)")
+        fast_planner = PredictivePlannerV8(
+            predictor_checkpoint="predictor/checkpoints/mlp_predictor_v7.pt",
+            verbose=False,
+        )
+        return fast_planner, None
+
+    if PLANNER_MODE == "llm_slow":
+        print("[Run] Using RulePlanner as FAST planner + LLMPlanner as SLOW planner")
+
+        fast_planner = RulePlanner(
+            use_predictor=False,
+            predictor_checkpoint=None,
+            predictor_weight=1.0,
             verbose=False,
         )
 
-    print("[Run] Using RulePlanner")
-    return RulePlanner()
+        slow_planner = LLMPlanner(
+            model_path=MODEL_PATH,
+            max_new_tokens=24,
+            temperature=0.0,
+            do_sample=False,
+            verbose=False,
+        )
 
+        return fast_planner, slow_planner
+
+    if PLANNER_MODE == "fast_predictive_legacy":
+        print("[Run] Using PredictiveRulePlanner as FAST planner")
+        fast_planner = PredictiveRulePlanner(
+            predictor_checkpoint="predictor/checkpoints/mlp_predictor_v7.pt",
+            use_predictor=True,
+            verbose=False,
+        )
+        return fast_planner, None
+
+    print("[Run] Using RulePlanner + Predictor V7")
+    fast_planner = RulePlanner(
+        use_predictor=True,
+        predictor_checkpoint="predictor/checkpoints/mlp_predictor_v7.pt",
+        predictor_weight=1.0,
+        verbose=False,
+    )
+    return fast_planner, None
 
 # =========================
 # Main
 # =========================
+
+
 def main() -> None:
     output_dir = os.path.join("outputs", OUTPUT_SUBDIR)
     os.makedirs(output_dir, exist_ok=True)
 
     all_results = []
 
-    # 🔥 IMPORTANT: build once, reuse across seeds
-    planner = build_planner()
+    # build once, reuse across seeds
+    fast_planner, slow_planner = build_planners()
 
     for seed in SEEDS:
         set_seed(seed)
@@ -139,7 +189,8 @@ def main() -> None:
 
             agent = AgentLoop(
                 env=env,
-                planner=planner,
+                fast_planner=fast_planner,
+                slow_planner=slow_planner,
                 sleep_time=SLEEP_TIME,
                 verbose=episode_verbose,
             )

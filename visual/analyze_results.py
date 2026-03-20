@@ -1,7 +1,7 @@
 import os
 import re
 
-LOG_DIR = "outputs/fast_predictive_legacy_15x15_seeded_debug"
+LOG_DIR = "outputs/rule_v5a_15x15"
 
 success_count = 0
 fail_count = 0
