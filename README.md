@@ -30,6 +30,7 @@ This avoids:
 
 ## System Architecture
 
+```mermaid
 Observation → StateEncoder → WorldMemory → Planner → SkillExecutor → Environment  
                                 ↑  
                              Monitor  
@@ -41,7 +42,7 @@ Observation → StateEncoder → WorldMemory → Planner → SkillExecutor → E
   - Rule / Predictive (fast): action execution  
 - Monitor → controls stability and replanning  
 - SkillExecutor → executes actions  
-
+```
 ---
 
 ## Components
@@ -119,9 +120,9 @@ Key-Door-Goal Grid World:
 
 - partial observability (local view only)  
 - multi-stage task:
-  1. find key
-  2. open door
-  3. reach goal  
+  1. `find key`
+  2. `open door`
+  3. `reach goal`  
 
 ---
 
@@ -148,7 +149,7 @@ Optional modes (inside code):
 ---
 
 ## Project Structure
-
+```text
 agent/
   agent_loop.py
 
@@ -179,6 +180,7 @@ scripts/
   run_agent.py
   collect_predictor_dataset.py
   train_predictor.py
+```
 
 ---
 
