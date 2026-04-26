@@ -31,9 +31,14 @@ This avoids:
 ## System Architecture
 
 ```mermaid
-Observation → StateEncoder → WorldMemory → Planner → SkillExecutor → Environment  
-                                ↑  
-                             Monitor  
+graph TD
+    A[Observation] --> B[StateEncoder]
+    B --> C[WorldMemory]
+    C --> D[Planner]
+    D --> E[SkillExecutor]
+    E --> F[Environment]
+
+    M[Monitor] --> D
 ```
 - StateEncoder → structured latent state  
 - WorldMemory → builds global map from partial observations  
