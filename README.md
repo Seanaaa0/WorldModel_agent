@@ -147,8 +147,9 @@ A larger 25x25 Rule V6a run achieved 95% success over 20 runs with 165.63 averag
 ---
 
 ## How to Run
-
+```text
 python run_agent.py
+```
 
 Optional modes (inside code):
 
